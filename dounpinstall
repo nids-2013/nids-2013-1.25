@@ -1,0 +1,9 @@
+cd src ; make  _install
+make[1]: 正在进入目录 `/home/project/libnids-1.25-5/src'
+../mkinstalldirs /usr/local/lib
+../mkinstalldirs /usr/local/include
+../mkinstalldirs /usr/local/man/man3
+/usr/bin/install -c -c -m 644 libnids.a /usr/local/lib
+/usr/bin/install -c -c -m 644 nids.h /usr/local/include
+/usr/bin/install -c -c -m 644 libnids.3 /usr/local/man/man3
+make[1]:正在离开目录 `/home/project/libnids-1.25-5/src'
