@@ -1,2 +1,0 @@
-gcc -c -g -O2 -D_BSD_SOURCE -I. -I../src -I/usr/local/include -D_BSD_SOURCE -D__BSD_SOURCE -D__FAVOR_BSD -DHAVE_NET_ETHERNET_H overflows.c
-gcc -o overflows overflows.o  -L../src -lnids -L/usr/local/lib -lpcap -lnet -lgthread-2.0 -lnsl 
