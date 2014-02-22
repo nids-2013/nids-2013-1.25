@@ -1,0 +1,5 @@
+doc/
+samples/*.dbg
+src/*.dbg
+*.dbg
+
