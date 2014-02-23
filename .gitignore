@@ -1,5 +1,9 @@
 doc/
 samples/*.dbg
+samples/*.o
+src/*.o
 src/*.dbg
+*.o
 *.dbg
+
 
