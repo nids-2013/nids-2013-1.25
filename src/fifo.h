@@ -1,24 +1,10 @@
 /*
- *  B-Queue -- An efficient and practical queueing for fast core-to-core
- *             communication
- *
- *  Copyright (C) 2011 Junchang Wang <junchang.wang@gmail.com>
- *
- *
- *  This program is free software: you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation, either version 3 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  This file is taken from :
+  B-Queue -- An efficient and practical queueing for fast core-to-core communication.
+  Copyright (C) 2011 Junchang Wang <junchang.wang@gmail.com>
+  
+  -- Modified in February 2014 by shashibici.
 */
-
 
 #ifndef _FIFO_B_QUQUQ_H_
 #define _FIFO_B_QUQUQ_H_
@@ -30,16 +16,20 @@
 #include <string.h>
 #include <stdint.h>
 
+#include "nids.h"
 
-#define ELEMENT_TYPE uint64_t
 
-#define QUEUE_SIZE (1024 * 8) 
+//#define ELEMENT_TYPE uint64_t
+
+#define QUEUE_SIZE (256) 
 #define BATCH_SIZE (QUEUE_SIZE/16)
 #define CONS_BATCH_SIZE BATCH_SIZE
 #define PROD_BATCH_SIZE BATCH_SIZE
 #define BATCH_INCREAMENT (BATCH_SIZE/2)
 
 #define CONGESTION_PENALTY (1000) /* cycles */
+typedef struct fifo_node* ELEMENT_TYPE;
+typedef struct fifo_node** ELEMENT_TYPE_P;
 
 #if defined(CONS_BATCH) || defined(PROD_BATCH)
 
@@ -63,6 +53,8 @@ struct queue_t{
 
 	/* accessed by both producer and comsumer */
 	ELEMENT_TYPE	data[QUEUE_SIZE] __attribute__ ((aligned(64)));
+	//struct fifo_node data[QUEUE_SIZE] __attribute__ ((aligned(64)));
+	
 } __attribute__ ((aligned(64)));
 
 #else
@@ -80,6 +72,8 @@ struct queue_t {
 
 	/* accessed by both producer and comsumer */
 	ELEMENT_TYPE	data[QUEUE_SIZE] __attribute__ ((aligned(64)));
+	//struct fifo_node data[QUEUE_SIZE] __attribute__ ((aligned(64)));
+
 } __attribute__ ((aligned(64)));
 
 #endif
@@ -88,11 +82,17 @@ struct queue_t {
 #define BUFFER_FULL -1
 #define BUFFER_EMPTY -2
 
+// externs
 void queue_init(struct queue_t *q);
-int enqueue(struct queue_t *q, ELEMENT_TYPE value);
+int enqueue(struct queue_t *q, char* data_buf, int data_len);
 int dequeue(struct queue_t *q, ELEMENT_TYPE *value);
 
+/* some inline utilities */
 inline uint64_t read_tsc();
 inline void wait_ticks(uint64_t);
+inline void setelezero(ELEMENT_TYPE ele);
+inline int iselezero(ELEMENT_TYPE ele);
 
 #endif
+
+

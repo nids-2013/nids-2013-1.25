@@ -4,6 +4,10 @@
 */
 
 
+// Here defiened wheather TEST or USE B-Queue feature
+// #define __TEST_BQUEUE__
+
+
 #include<pthread.h>
 #include <config.h>
 #include <sys/types.h>
@@ -39,6 +43,14 @@
 #define PROD_BATCH
 #include "fifo.h"
 #define TEST_SIZE 20000
+
+struct queue_t *fifo_queue;
+ELEMENT_TYPE inputelement;
+ELEMENT_TYPE outputelement;
+static unsigned long inputcount;
+static unsigned long outputcount;
+static long discardcount;
+
 // end add
 
 
@@ -631,38 +643,33 @@ static void process_udp(char *data)
 	}
 }
 
+
 // modified
+// This is mostly like consumer.
 static void nids_function()
 {
-	struct fifo_node* current;
+
+	ELEMENT_TYPE current;
 
 	while(1)
 	{
-		if(!fifo || !fifo->head)
-			nids_exit();
 
-		//if(fifo->head == fifo->tail)
-
-		//continue;
-		sem_wait(&sem_full);
-		current = fifo->head;
-
-		///////////////////////////
-		tcp_get++;
-		//printf("\ncore %d get:%d   pointer:%p   data:%p  len:%d \n",sched_getcpu(), tcp_get, fifo->head, fifo->head->data, fifo->head->skblen);
-
-		if (fifo->head >= fifo->end)
+		// The only thing we need to do is dequeue
+		if (SUCCESS == dequeue(fifo_queue, &current))
 		{
-			fifo->head = fifo->start;
+			process_tcp((u_char*)(current->data), current->skblen);
+			// release this element
+			// FIXME: I think it would be batter to release element
+			// after process_tcp otherwise producer would risk reusing
+			// this buffer before it is read for the next tcp datagram.
+			setelezero(current);
+			outputcount ++;
 		}
+		// buffer is empty
 		else
 		{
-			fifo->head += 1;
+			// do nothing.
 		}
-
-
-		sem_post(&sem_empty);
-		process_tcp((u_char*)(current->data), current->skblen);
 	}
 }
 // end - 2014-01-25
@@ -681,39 +688,22 @@ static void gen_ip_proc(u_char * data, int skblen)
 	{
 		// Èç¹ûÉÏ²ãÊÇTCPÄÇÃŽŸÍµ÷ÓÃTCPŽŠÀíº¯Êý
 	case IPPROTO_TCP:
-		// modified
-		// todo:  put queue
-		if (!fifo || !fifo->head)
-			return;
-		// compute mod mask
-
-		// if fifo is full then return;
-		//if ((fifo->head - fifo->tail == 1) || (fifo->tail - fifo->head == fifo->fifo_len - 1))
-		//return;
-		sem_wait(&sem_empty);////////////////
-		// put ip data into fifo queue
-		memcpy(fifo->tail->data, (char*)iph, skblen);
-		//fifo->tail->data = iph;
-		fifo->tail->skblen = skblen;
-
-
-		///////////////////////////
-		tcp_put++;
-		//printf("\ncore%d put:%d  pointer:%p  data:%p len:%d\n",sched_getcpu(), tcp_put, fifo->tail, fifo->tail->data, fifo->tail->skblen);
-
-		if (fifo->tail >= fifo->end)
+		// Actually, this procedure will be called loopedly
+		// so we don't need a while here.
+		
+		if (SUCCESS == enqueue(fifo_queue, (char*)iph, skblen))
 		{
-			fifo->tail = fifo->start;
+			// it means buffer is not totally full yet if success
+			inputcount++;
 		}
 		else
 		{
-			fifo->tail += 1;
+			// it means buffer is totally full and
+			// this tcp datagram is discarded.
+			printf("This tcp datagram is discarded!\n");
+			discardcount ++;
 		}
-
-
-		sem_post(&sem_full);
-
-		//process_tcp(data, skblen);
+		
 		break;
 		// Èç¹ûÉÏ²ãÊÇUDPÄÇÃŽŸÍµ÷ÓÃUDPŽŠÀíº¯Êý
 	case IPPROTO_UDP:
@@ -887,12 +877,12 @@ static void cap_queue_process_thread()
 int nids_init()
 {
 
-	struct fifo_node * fifo_current;
+	ELEMENT_TYPE fifo_node_p;
+	ELEMENT_TYPE_P buf_current, buf_end;
 	char * ptr;
 
 	///////////////////////////
-	printf("\nnids_init 001 \n");
-
+	printf("\n nids_init 001 \n");
 
 
 	/* free resources that previous usages might have allocated */
@@ -1000,58 +990,67 @@ int nids_init()
 
 
 
+	///////////////////////////
+	printf("\n nids_init 002 \n");
 
-
-	//add: 2014 1 25  2
-	sem_init(&sem_full,0,0);
-	sem_init(&sem_empty,0,FIFO_MAX);
-	//end add
-
-
-
-
-
-	// modified  2014-01-25
-	fifo = mknew(struct nids_fifo);
-	if (!fifo)
-		return 0;
-
-
-
-	fifo->fifo_len = FIFO_MAX;
-
-	fifo->tail = fifo->head = mknew_n(struct fifo_node, fifo->fifo_len);
-
-
-	fifo->start = fifo->head;
-	fifo->end = fifo->head + fifo->fifo_len - 1;
-	if ( !(fifo->tail) || !(fifo->head))
+	// init
+	fifo_queue = mknew(struct queue_t);
+	if (!fifo_queue)
 	{
-		free(fifo);
+		return 0;	
+	}
+	queue_init(fifo_queue);
+	inputcount = 0;
+	outputcount = 0;
+	discardcount = 0;
+
+	///////////////////////////
+	printf("\n nids_init 003 \n");
+
+
+	// init element for fifo_queue->data
+	fifo_node_p = mknew_n(struct fifo_node, QUEUE_SIZE);
+	if (!fifo_node_p)
+	{
+		free(fifo_queue);
 		return 0;
 	}
+	buf_end = fifo_queue->data + QUEUE_SIZE;
+	for (buf_current = fifo_queue->data; buf_current < buf_end; buf_current++, fifo_node_p ++)
+	{
+		(*buf_current) = fifo_node_p;
+	}
+	
 
 
 	// allocate a buffer for fifo
 	// 65535B for each tcp datagram
-	ptr = mknew_n(char, 65535*FIFO_MAX);
+	ptr = mknew_n(char, 65535*QUEUE_SIZE);
 	if (!ptr)
 	{
+		free(fifo_queue);
+		free(fifo_node_p);
 		return 0;
 	}
 
-
+	///////////////////////////
+	printf("\n nids_init 004 \n");
 
 	// initialize fifo_node
-	for (fifo_current = fifo->head; fifo_current <= fifo->end; fifo_current++, ptr += 65535)
+	
+	buf_end = fifo_queue->data + QUEUE_SIZE;
+	for (buf_current = fifo_queue->data; buf_current < buf_end;
+			buf_current++, ptr += 65535)
 	{
-		fifo_current->data = ptr;
-		fifo_current->skblen = 0;
+		////////////////////////////////////
+		printf("buf_end=0x%p, data=0x%p, buf_current=0x%p \n", buf_end, fifo_queue->data, buf_current);
+		(*buf_current)->data = ptr;
+		(*buf_current)->skblen = -1;
 	}
 
 
-
-	// end 2014-01-25
+	///////////////////////////
+	printf("\n nids_init 005 \n");
 
 	return 1;
 }
@@ -1067,18 +1066,19 @@ int nids_run()
 		return 0;
 	}
 
-
-
-
-
-	//add: thread 2014 1 25   3
-	//FifoProces();
-	//end add
+#ifdef __TEST_BQUEUE__
 
 	//add: bqueue test 2014-02-22
-	BqueueProces();
+	TestBqueue();
 	// end add
+	
+#else
 
+	//add: thread 2014 1 25   3
+	FifoProces();
+	//end add
+	
+#endif
 
 
 	//START_CAP_QUEUE_PROCESS_THREAD(); /* threading... */
@@ -1092,6 +1092,8 @@ int nids_run()
 	nids_exit();
 	return 0;
 }
+
+
 //newadd 2014 2 18
 void FifoProces()
 {
@@ -1121,6 +1123,7 @@ void FifoProces()
 //end newadd
 
 //add: 2014 1 25 4
+// running pcap_loop to capture packages from ethernet.
 void * thread_pros1(void *arg)
 {
 	cpu_set_t mask;//cpuºËµÄŒ¯ºÏ
@@ -1156,6 +1159,8 @@ void * thread_pros1(void *arg)
 	//gen_ip_frag_proc;
 }
 
+// running nids_functions to trip into a dead loop
+// in the loop we tackle tcp datagrams.
 void *thread_pros2(void * arg)
 {
 	cpu_set_t mask;//cpuºËµÄŒ¯ºÏ
@@ -1274,13 +1279,7 @@ int nids_dispatch(int cnt)
 }
 
 // Add:2014-02-22
-ELEMENT_TYPE ELEMENT_NULL = 0x0UL;
-struct queue_t fifo_queue;
-ELEMENT_TYPE inputelement;
-ELEMENT_TYPE outputelement;
-ELEMENT_TYPE queue_buffer[TEST_SIZE];
-static unsigned long inputcount;
-static unsigned long outputcount;
+#ifdef __TEST_BQUEUE__
 
 
 // Fifo test
@@ -1333,7 +1332,7 @@ void testFifoWrite()
 }
 
 // Multi-thread
-void BqueueProces()
+void TestBqueue()
 {
 	// init
 	testFifoInit();
@@ -1360,6 +1359,7 @@ void BqueueProces()
 	pthread_join(th2,NULL);
 }
 
+#endif
 // End add 2014-02-22
 
 

@@ -1,25 +1,12 @@
 /*
- *  B-Queue -- An efficient and practical queueing for fast core-to-core
- *             communication
- *
- *  Copyright (C) 2011 Junchang Wang <junchang.wang@gmail.com>
- *
- *
- *  This program is free software: you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation, either version 3 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  This file is taken from :
+  B-Queue -- An efficient and practical queueing for fast core-to-core communication.
+  Copyright (C) 2011 Junchang Wang <junchang.wang@gmail.com>
+  
+  -- Modified in February 2014 by shashibici.
+  
 */
-
-
+#include <string.h>
 #include "fifo.h"
 #include <sched.h>
 
@@ -53,8 +40,8 @@ inline void wait_ticks(uint64_t ticks)
         } while (current_time < time);
 }
 
-/* uint64_t */
-static ELEMENT_TYPE ELEMENT_ZERO = 0x0UL;
+// uint64_t 
+//static ELEMENT_TYPE ELEMENT_ZERO = 0x0UL;
 
 /*************************************************/
 /********** Queue Functions **********************/
@@ -62,7 +49,16 @@ static ELEMENT_TYPE ELEMENT_ZERO = 0x0UL;
 
 void queue_init(struct queue_t *q)
 {
+
+	///////////////////////////
+	printf("\n queue_init 001 \n");
+
+
 	memset(q, 0, sizeof(struct queue_t));
+
+	///////////////////////////
+	printf("\n queue_init 002 \n");
+
 #if defined(CONS_BATCH)
 	q->batch_history = CONS_BATCH_SIZE;
 #endif
@@ -76,20 +72,34 @@ inline int leqthan(volatile ELEMENT_TYPE point, volatile ELEMENT_TYPE batch_poin
 }
 #endif
 
+inline void setelezero(ELEMENT_TYPE ele)
+{
+	ele->skblen = -1;
+}
+
+inline int iselezero(ELEMENT_TYPE ele)
+{
+	return (ele->skblen == -1);
+}
+
 
 #if defined(PROD_BATCH)
-int enqueue(struct queue_t * q, ELEMENT_TYPE value)
+int enqueue(struct queue_t * q, char* data_buf, int data_len)
 {
 	uint32_t tmp_head;
 	/* if there is no space for producer*/
-	if( q->head == q->batch_head ) {
+	if ( q->head == q->batch_head ) 
+	{
 		// move head forward
 		tmp_head = q->head + PROD_BATCH_SIZE;
 		// if overhead set to 0
 		if ( tmp_head >= QUEUE_SIZE )
+		{
 			tmp_head = 0;
+		}
 		// if the destination is full wait.
-		if ( q->data[tmp_head] ) {
+		if ( !iselezero(q->data[tmp_head]) ) 
+		{
 			wait_ticks(CONGESTION_PENALTY);
 			return BUFFER_FULL;
 		}
@@ -97,27 +107,33 @@ int enqueue(struct queue_t * q, ELEMENT_TYPE value)
 		q->batch_head = tmp_head;
 	}
 	
-	// enqueue
-	q->data[q->head] = value;
+	// else enqueue
+	memcpy(q->data[q->head]->data, data_buf, skblen);
+	q->data[q->head]->skblen = data_len;
 	q->head ++;
 	// adjust head
-	if ( q->head >= QUEUE_SIZE ) {
+	if ( q->head >= QUEUE_SIZE ) 
+	{
 		q->head = 0;
 	}
 
 	return SUCCESS;
 }
 #else
-int enqueue(struct queue_t * q, ELEMENT_TYPE value)
+int enqueue(struct queue_t * q, char* data_buf, int data_len)
 {
 	// if current head is full then return
-	if ( q->data[q->head] )
+	if ( !iselezero(q->data[q->head]) )
+	{
 		return BUFFER_FULL;
+	}
 	// else enqueue
-	q->data[q->head] = value;
+	memcpy(q->data[q->head]->data, data_buf, data_len);
+	q->data[q->head]->skblen = data_len;
 	q->head ++;
 	// adjust head
-	if ( q->head >= QUEUE_SIZE ) {
+	if ( q->head >= QUEUE_SIZE ) 
+	{
 		q->head = 0;
 	}
 
@@ -133,11 +149,13 @@ static inline int backtracking(struct queue_t * q)
 	// get next batch_tail
 	tmp_tail = q->tail + CONS_BATCH_SIZE;
 	// if next batch_tail is lager than queue_size then adjust.
-	if ( tmp_tail >= QUEUE_SIZE ) {
+	if ( tmp_tail >= QUEUE_SIZE ) 
+	{
 		tmp_tail = 0;
 #if defined(ADAPTIVE)
 		// if history is smaller then adjust history
-		if (q->batch_history < CONS_BATCH_SIZE) {
+		if (q->batch_history < CONS_BATCH_SIZE) 
+		{
 			q->batch_history = 
 				// if history+increment > batch_size than history is batch_size else is history+increment
 				// to make sure history no more than batch_size
@@ -152,13 +170,15 @@ static inline int backtracking(struct queue_t * q)
 	// uodate current batch_size to history
 	unsigned long batch_size = q->batch_history;
 	// if tmp_tail is empty then loop
-	while (!(q->data[tmp_tail])) {
+	while ( iselezero(q->data[tmp_tail]) ) 
+	{
 		// wait a moment
 		wait_ticks(CONGESTION_PENALTY);
 		// half the batch_size
 		batch_size = batch_size >> 1;
 		// if batch_size >= 0 then modify the tmp_tail
-		if( batch_size >= 0 ) {
+		if( batch_size >= 0 ) 
+		{
 			tmp_tail = q->tail + batch_size;
 			if (tmp_tail >= QUEUE_SIZE)
 				tmp_tail = 0;		
@@ -166,7 +186,9 @@ static inline int backtracking(struct queue_t * q)
 		// so that the comsumer can read from the queue
 		}
 		else
+		{
 			return -1;
+		}
 	}
 #if defined(ADAPTIVE)
 	q->batch_history = batch_size;
@@ -174,8 +196,9 @@ static inline int backtracking(struct queue_t * q)
 
 // else no BACKTRACKING
 #else
-	// wait until the element is not empty
-	if ( !q->data[tmp_tail] ) {
+	// wait unless the element is not empty
+	if ( iselezero(q->data[tmp_tail]) ) 
+	{
 		wait_ticks(CONGESTION_PENALTY); 
 		return -1;
 	}
@@ -183,7 +206,8 @@ static inline int backtracking(struct queue_t * q)
 	
 	// it indecats that no space is available to read if tmp_tail == tail
 	// because each time tmp_tail will forwarad at most batch_size
-	if ( tmp_tail == q->tail ) {
+	if ( tmp_tail == q->tail ) 
+	{
 		tmp_tail = (tmp_tail + 1) >= QUEUE_SIZE ?
 			0 : tmp_tail + 1;
 	}
@@ -196,7 +220,8 @@ static inline int backtracking(struct queue_t * q)
 int dequeue(struct queue_t * q, ELEMENT_TYPE * value)
 {
 	// if tail go to the end of this batch
-	if( q->tail == q->batch_tail ) {
+	if( q->tail == q->batch_tail ) 
+	{
 		// get a backracing to update batch_tail
 		if ( backtracking(q) != 0 )
 			return BUFFER_EMPTY;
@@ -204,7 +229,7 @@ int dequeue(struct queue_t * q, ELEMENT_TYPE * value)
 	
 	// else dqueue
 	*value = q->data[q->tail];
-	q->data[q->tail] = ELEMENT_ZERO;
+	setelezero(q->data[q->tail]);
 	q->tail ++;
 	if ( q->tail >= QUEUE_SIZE )
 		q->tail = 0;
@@ -218,11 +243,13 @@ int dequeue(struct queue_t * q, ELEMENT_TYPE * value)
 int dequeue(struct queue_t * q, ELEMENT_TYPE * value)
 {
 	// if tail is empty then return empty
-	if ( !q->data[q->tail] )
+	if ( iselezero(q->data[q->tail]) )
+	{
 		return BUFFER_EMPTY;
+	}
 	// else dequeue
 	*value = q->data[q->tail];
-	q->data[q->tail] = ELEMENT_ZERO;
+	setelezero(q->data[q->tail]);
 	q->tail ++;
 	// adjust tail
 	if ( q->tail >= QUEUE_SIZE )
@@ -232,3 +259,5 @@ int dequeue(struct queue_t * q, ELEMENT_TYPE * value)
 }
 
 #endif  /* end of CONS_BATCH */
+
+

@@ -23,6 +23,9 @@ See the file COPYING for license details.
 #include <sched.h>
 #include <stdio.h>
 
+
+
+
 // struct tuple4 contains addresses and port numbers of the TCP connections
 // the following auxiliary function produces a string looking like
 // 10.0.0.1,1024,10.0.0.2,23
@@ -96,7 +99,7 @@ tcp_callback (struct tcp_stream *a_tcp, void ** this_time_not_needed)
 			strcat(buf,"(urgent->)");
 			buf[strlen(buf)+1]=0;
 			// 保存紧急数据
-			buf[strlen(buf)]=a_tcp->server.urgdata;
+			// buf[strlen(buf)]=a_tcp->server.urgdata;
 			// 在标准输出上显示
 			write(1,buf,strlen(buf));
 			return;
