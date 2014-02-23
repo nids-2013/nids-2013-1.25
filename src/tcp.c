@@ -956,7 +956,7 @@ process_tcp(u_char * data, int skblen)
 		//ºÏ—È–Ú¡–
 		nids_params.syslog(NIDS_WARN_TCP, NIDS_WARN_TCP_HDR, this_iphdr,
 		                   this_tcphdr);
-		return;
+		//return;
 	}
 #if 0
 	check_flags(this_iphdr, this_tcphdr);

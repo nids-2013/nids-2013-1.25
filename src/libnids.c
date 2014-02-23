@@ -3,11 +3,6 @@
   See the file COPYING for license details.
 */
 
-
-// Here defiened wheather TEST or USE B-Queue feature
-// #define __TEST_BQUEUE__
-
-
 #include<pthread.h>
 #include <config.h>
 #include <sys/types.h>
@@ -39,8 +34,8 @@
 
 // add: 2014-2-22
 // B-Queue
-#define CONS_BATCH
-#define PROD_BATCH
+//#define CONS_BATCH
+//#define PROD_BATCH
 #include "fifo.h"
 #define TEST_SIZE 20000
 
@@ -311,6 +306,8 @@ static void call_ip_frag_procs(void *data,bpf_u_int32 caplen)
 */
 void nids_pcap_handler(u_char * par, struct pcap_pkthdr *hdr, u_char * data)
 {
+
+
 	u_char *data_aligned;
 #ifdef HAVE_LIBGTHREAD_2_0
 	struct cap_queue_item *qitem;
@@ -657,18 +654,23 @@ static void nids_function()
 		// The only thing we need to do is dequeue
 		if (SUCCESS == dequeue(fifo_queue, &current))
 		{
-			process_tcp((u_char*)(current->data), current->skblen);
+			process_tcp((u_char*)(current.data), current.skblen);
 			// release this element
 			// FIXME: I think it would be batter to release element
 			// after process_tcp otherwise producer would risk reusing
 			// this buffer before it is read for the next tcp datagram.
-			setelezero(current);
 			outputcount ++;
+			printf("\ntcp dequeue! output = %d\n", outputcount);
 		}
 		// buffer is empty
 		else
 		{
 			// do nothing.
+			while(SUCCESS != dequeue(fifo_queue, &current))
+			{
+				sleep(1);
+			}
+			//printf("\nqueue is empty! \n");
 		}
 	}
 }
@@ -695,13 +697,18 @@ static void gen_ip_proc(u_char * data, int skblen)
 		{
 			// it means buffer is not totally full yet if success
 			inputcount++;
+			printf("\ntcp enqueue!, input = %d\n", inputcount);
 		}
 		else
 		{
-			// it means buffer is totally full and
-			// this tcp datagram is discarded.
-			printf("This tcp datagram is discarded!\n");
-			discardcount ++;
+			// wait untill equeue successfully
+			while(SUCCESS != enqueue(fifo_queue, (char*)iph, skblen))
+			{
+				sleep(1);
+			}
+			//printf("%d discarded!\n", discardcount);
+			//discardcount ++;
+			
 		}
 		
 		break;
@@ -877,8 +884,8 @@ static void cap_queue_process_thread()
 int nids_init()
 {
 
-	ELEMENT_TYPE fifo_node_p;
-	ELEMENT_TYPE_P buf_current, buf_end;
+	ELEMENT_TYPE bq_node;
+	ELEMENT_TYPE_P bq_current, bq_end;
 	char * ptr;
 
 	///////////////////////////
@@ -999,6 +1006,7 @@ int nids_init()
 	{
 		return 0;	
 	}
+	// set fifo_queue with '0'
 	queue_init(fifo_queue);
 	inputcount = 0;
 	outputcount = 0;
@@ -1007,7 +1015,7 @@ int nids_init()
 	///////////////////////////
 	printf("\n nids_init 003 \n");
 
-
+#if 0
 	// init element for fifo_queue->data
 	fifo_node_p = mknew_n(struct fifo_node, QUEUE_SIZE);
 	if (!fifo_node_p)
@@ -1020,32 +1028,33 @@ int nids_init()
 	{
 		(*buf_current) = fifo_node_p;
 	}
-	
+#endif
 
 
-	// allocate a buffer for fifo
-	// 65535B for each tcp datagram
+	// allocate a buffer for tcp data.
+	// 65535B for each tcp datagram.
 	ptr = mknew_n(char, 65535*QUEUE_SIZE);
 	if (!ptr)
 	{
 		free(fifo_queue);
-		free(fifo_node_p);
 		return 0;
 	}
 
 	///////////////////////////
 	printf("\n nids_init 004 \n");
 
-	// initialize fifo_node
-	
-	buf_end = fifo_queue->data + QUEUE_SIZE;
-	for (buf_current = fifo_queue->data; buf_current < buf_end;
-			buf_current++, ptr += 65535)
+	// Initialize fifo_node
+	// Eache node has a point, 'data', pointing to a buffer.
+	// There are 65535 buffers but they are allocated at a time
+	// referenced by 'ptr'.
+	bq_end = fifo_queue->data + QUEUE_SIZE;
+	for (bq_current = fifo_queue->data; bq_current < bq_end;
+			bq_current++, ptr += 65535)
 	{
 		////////////////////////////////////
-		printf("buf_end=0x%p, data=0x%p, buf_current=0x%p \n", buf_end, fifo_queue->data, buf_current);
-		(*buf_current)->data = ptr;
-		(*buf_current)->skblen = -1;
+		//printf("bq_end=0x%p, data=0x%p, bq_current=0x%p \n", bq_end, fifo_queue->data, bq_current);
+		bq_current->data = ptr;
+		bq_current->skblen = -1;
 	}
 
 
@@ -1066,19 +1075,10 @@ int nids_run()
 		return 0;
 	}
 
-#ifdef __TEST_BQUEUE__
-
-	//add: bqueue test 2014-02-22
-	TestBqueue();
-	// end add
-	
-#else
 
 	//add: thread 2014 1 25   3
 	FifoProces();
 	//end add
-	
-#endif
 
 
 	//START_CAP_QUEUE_PROCESS_THREAD(); /* threading... */
@@ -1278,89 +1278,6 @@ int nids_dispatch(int cnt)
 	return r;
 }
 
-// Add:2014-02-22
-#ifdef __TEST_BQUEUE__
-
-
-// Fifo test
-void testFifoInit()
-{
-	queue_init(&fifo_queue);
-	memset(queue_buffer, ELEMENT_NULL, TEST_SIZE * sizeof(ELEMENT_TYPE));
-	inputelement = 0x5UL;
-	inputcount = outputcount = 0x0;
-	
-
-}
-
-void testFifoRead()
-{
-	while(outputcount < 0xffffffff)
-	{
-		if (0 == dequeue(&fifo_queue, &outputelement))
-		{
-			outputcount += 1;
-			if (0x0 == (outputcount & 0xff))
-			{
-				printf("\ndequeue: %x\n", outputcount);
-			}
-			continue;
-		}
-		// else
-		// sleep 1s
-		sleep(1);
-	}
-}
-
-void testFifoWrite()
-{
-	while(inputcount < 0xffffffff)
-	{
-		if (0 == enqueue(&fifo_queue, inputelement))
-		{
-			inputcount += 1;
-			if (0x0 == (inputcount & 0xff))
-			{
-				printf("\nenqueue: %x\n", inputcount);
-			}
-			continue;
-		}
-		// else
-		// sleep 1s
-		sleep(1);
-	}
-}
-
-// Multi-thread
-void TestBqueue()
-{
-	// init
-	testFifoInit();
-	
-	coreNum=sysconf(_SC_NPROCESSORS_CONF);//»ñÈ¡ºËÊý
-	//printf("core num=%d\n",coreNum);
-	//tid ÓÃÀŽ±êÊŸ²»Í¬µÄÏß³ÌidºÅ£¬ÓÃÒÔ°ó¶š¶ÔÓÃµÄcpu
-	int i,tid[2]= {0,1};
-	//thread_error=pthread_create(&th1,NULL,thread_pros1,(void*)&tid[0]);
-	thread_error=pthread_create(&th1,NULL,testFifoRead,NULL);
-	if(thread_error!=0)
-	{
-		sprintf("error:%s\n",strerror(thread_error));
-		return 0;
-	}
-	//thread_error=pthread_create(&th2,NULL,thread_pros2,(void*)&tid[1]);
-	thread_error=pthread_create(&th2,NULL,testFifoWrite,NULL);
-	if(thread_error!=0)
-	{
-		sprintf("error:%s\n",strerror(thread_error));
-		return 0;
-	}
-	pthread_join(th1,NULL);
-	pthread_join(th2,NULL);
-}
-
-#endif
-// End add 2014-02-22
 
 
 

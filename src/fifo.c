@@ -59,31 +59,30 @@ void queue_init(struct queue_t *q)
 	///////////////////////////
 	printf("\n queue_init 002 \n");
 
-#if defined(CONS_BATCH)
 	q->batch_history = CONS_BATCH_SIZE;
-#endif
 }
 
 /* compare tow points wheather they equal to each other*/
-#if defined(PROD_BATCH) || defined(CONS_BATCH)
+# if 0
 inline int leqthan(volatile ELEMENT_TYPE point, volatile ELEMENT_TYPE batch_point)
 {
 	return (point == batch_point);
 }
-#endif
+# endif
 
-inline void setelezero(ELEMENT_TYPE ele)
+
+inline void setelezero(ELEMENT_TYPE_P ele)
 {
 	ele->skblen = -1;
 }
 
-inline int iselezero(ELEMENT_TYPE ele)
+inline _Bool iselezero(ELEMENT_TYPE ele)
 {
-	return (ele->skblen == -1);
+	return (ele.skblen == -1);
 }
 
 
-#if defined(PROD_BATCH)
+
 int enqueue(struct queue_t * q, char* data_buf, int data_len)
 {
 	uint32_t tmp_head;
@@ -100,6 +99,7 @@ int enqueue(struct queue_t * q, char* data_buf, int data_len)
 		// if the destination is full wait.
 		if ( !iselezero(q->data[tmp_head]) ) 
 		{
+			printf("skblen = %x", (q->data[tmp_head]).skblen);
 			wait_ticks(CONGESTION_PENALTY);
 			return BUFFER_FULL;
 		}
@@ -108,8 +108,8 @@ int enqueue(struct queue_t * q, char* data_buf, int data_len)
 	}
 	
 	// else enqueue
-	memcpy(q->data[q->head]->data, data_buf, skblen);
-	q->data[q->head]->skblen = data_len;
+	memcpy((q->data[q->head]).data, data_buf, data_len);
+	(q->data[q->head]).skblen = data_len;
 	q->head ++;
 	// adjust head
 	if ( q->head >= QUEUE_SIZE ) 
@@ -119,29 +119,7 @@ int enqueue(struct queue_t * q, char* data_buf, int data_len)
 
 	return SUCCESS;
 }
-#else
-int enqueue(struct queue_t * q, char* data_buf, int data_len)
-{
-	// if current head is full then return
-	if ( !iselezero(q->data[q->head]) )
-	{
-		return BUFFER_FULL;
-	}
-	// else enqueue
-	memcpy(q->data[q->head]->data, data_buf, data_len);
-	q->data[q->head]->skblen = data_len;
-	q->head ++;
-	// adjust head
-	if ( q->head >= QUEUE_SIZE ) 
-	{
-		q->head = 0;
-	}
 
-	return SUCCESS;
-}
-#endif
-
-#if defined(CONS_BATCH)
 
 static inline int backtracking(struct queue_t * q)
 {
@@ -152,7 +130,7 @@ static inline int backtracking(struct queue_t * q)
 	if ( tmp_tail >= QUEUE_SIZE ) 
 	{
 		tmp_tail = 0;
-#if defined(ADAPTIVE)
+
 		// if history is smaller then adjust history
 		if (q->batch_history < CONS_BATCH_SIZE) 
 		{
@@ -162,10 +140,10 @@ static inline int backtracking(struct queue_t * q)
 				(CONS_BATCH_SIZE < (q->batch_history + BATCH_INCREAMENT))? 
 				CONS_BATCH_SIZE : (q->batch_history + BATCH_INCREAMENT);
 		}
-#endif
+
 	}
 
-#if defined(BACKTRACKING)
+
 
 	// uodate current batch_size to history
 	unsigned long batch_size = q->batch_history;
@@ -190,19 +168,11 @@ static inline int backtracking(struct queue_t * q)
 			return -1;
 		}
 	}
-#if defined(ADAPTIVE)
-	q->batch_history = batch_size;
-#endif
 
-// else no BACKTRACKING
-#else
-	// wait unless the element is not empty
-	if ( iselezero(q->data[tmp_tail]) ) 
-	{
-		wait_ticks(CONGESTION_PENALTY); 
-		return -1;
-	}
-#endif  /* end BACKTRACKING */
+	q->batch_history = batch_size;
+
+
+
 	
 	// it indecats that no space is available to read if tmp_tail == tail
 	// because each time tmp_tail will forwarad at most batch_size
@@ -217,7 +187,7 @@ static inline int backtracking(struct queue_t * q)
 	return 0;
 }
 
-int dequeue(struct queue_t * q, ELEMENT_TYPE * value)
+int dequeue(struct queue_t * q, ELEMENT_TYPE_P value)
 {
 	// if tail go to the end of this batch
 	if( q->tail == q->batch_tail ) 
@@ -229,7 +199,7 @@ int dequeue(struct queue_t * q, ELEMENT_TYPE * value)
 	
 	// else dqueue
 	*value = q->data[q->tail];
-	setelezero(q->data[q->tail]);
+	setelezero(&(q->data[q->tail]));
 	q->tail ++;
 	if ( q->tail >= QUEUE_SIZE )
 		q->tail = 0;
@@ -237,27 +207,6 @@ int dequeue(struct queue_t * q, ELEMENT_TYPE * value)
 	return SUCCESS;
 }
 
-// no CONS_BATCH
-#else
 
-int dequeue(struct queue_t * q, ELEMENT_TYPE * value)
-{
-	// if tail is empty then return empty
-	if ( iselezero(q->data[q->tail]) )
-	{
-		return BUFFER_EMPTY;
-	}
-	// else dequeue
-	*value = q->data[q->tail];
-	setelezero(q->data[q->tail]);
-	q->tail ++;
-	// adjust tail
-	if ( q->tail >= QUEUE_SIZE )
-		q->tail = 0;
-
-	return SUCCESS;
-}
-
-#endif  /* end of CONS_BATCH */
 
 

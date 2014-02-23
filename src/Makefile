@@ -33,6 +33,7 @@ INSTALL		= /usr/bin/install -c
 OBJS		= checksum.o ip_fragment.o ip_options.o killtcp.o \
 		  libnids.o scan.o tcp.o util.o allpromisc.o hash.o \
                   fifo.o
+
 OBJS_SHARED	= $(OBJS:.o=_pic.o)
 .c.o:
 	$(CC) -c $(CFLAGS) -I. $(LIBS_CFLAGS) $<
@@ -60,9 +61,8 @@ allpromisc_pic.o: allpromisc.c
 	$(CC) -fPIC $(CFLAGS) -I. $(LIBS_CFLAGS) -c allpromisc.c -o $@
 hash_pic.o: hash.c
 	$(CC) -fPIC $(CFLAGS) -I. $(LIBS_CFLAGS) -c hash.c -o $@
-fifo.o: fifo.c
+fifo.o : fifo.c
 	$(CC) -fPIC $(CFLAGS) -I. $(LIBS_CFLAGS) -c fifo.c -o $@
-
 
 
 $(LIBSTATIC): $(OBJS)

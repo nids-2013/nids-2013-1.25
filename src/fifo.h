@@ -28,10 +28,10 @@
 #define BATCH_INCREAMENT (BATCH_SIZE/2)
 
 #define CONGESTION_PENALTY (1000) /* cycles */
-typedef struct fifo_node* ELEMENT_TYPE;
-typedef struct fifo_node** ELEMENT_TYPE_P;
+typedef struct fifo_node ELEMENT_TYPE;
+typedef struct fifo_node* ELEMENT_TYPE_P;
 
-#if defined(CONS_BATCH) || defined(PROD_BATCH)
+
 
 // Note that this struct is aligned by 64B.
 // and some of its members are aligned by 64B as well.
@@ -53,30 +53,11 @@ struct queue_t{
 
 	/* accessed by both producer and comsumer */
 	ELEMENT_TYPE	data[QUEUE_SIZE] __attribute__ ((aligned(64)));
-	//struct fifo_node data[QUEUE_SIZE] __attribute__ ((aligned(64)));
+	
 	
 } __attribute__ ((aligned(64)));
 
-#else
 
-struct queue_t {
-	/* Mostly accessed by producer. */
-	volatile	uint32_t	head;
-
-	/* Mostly accessed by consumer. */
-	volatile 	uint32_t	tail __attribute__ ((aligned(64)));
-
-	/* readonly data */
-	uint64_t	start_c __attribute__ ((aligned(64)));
-	uint64_t	stop_c;
-
-	/* accessed by both producer and comsumer */
-	ELEMENT_TYPE	data[QUEUE_SIZE] __attribute__ ((aligned(64)));
-	//struct fifo_node data[QUEUE_SIZE] __attribute__ ((aligned(64)));
-
-} __attribute__ ((aligned(64)));
-
-#endif
 
 #define SUCCESS 0
 #define BUFFER_FULL -1
@@ -85,13 +66,13 @@ struct queue_t {
 // externs
 void queue_init(struct queue_t *q);
 int enqueue(struct queue_t *q, char* data_buf, int data_len);
-int dequeue(struct queue_t *q, ELEMENT_TYPE *value);
+int dequeue(struct queue_t *q, ELEMENT_TYPE_P value);
 
 /* some inline utilities */
 inline uint64_t read_tsc();
 inline void wait_ticks(uint64_t);
-inline void setelezero(ELEMENT_TYPE ele);
-inline int iselezero(ELEMENT_TYPE ele);
+inline void setelezero(ELEMENT_TYPE_P ele);
+inline _Bool iselezero(ELEMENT_TYPE ele);
 
 #endif
 
