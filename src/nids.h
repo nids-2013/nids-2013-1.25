@@ -111,10 +111,15 @@ struct half_stream
   // 
   int urg_count;
   u_int acked;
+  // libnids监听到一个tcp报文，这个报文的seq字段值就会立即填入
+  // 对应半连接的seq域中
   u_int seq;
+  // libnids监听到一个tcp报文，这个报文的ack字段值就会立即填入
+  // 对应半连接的ack_seq域中
   u_int ack_seq;
   // 本半链接第一个字节序号
   u_int first_data_seq;
+  // 指向本半链接收到的报文中，紧急数据的起始位置
   u_char urgdata;
   // 一个标志，在notify函数中会使用到，记录是否收到了一个新的紧急报文
   u_char count_new_urg;
@@ -128,9 +133,7 @@ struct half_stream
   u_char ts_on;
   // 记录是否使用窗口大小
   u_char wscale_on;
-  // 当前时间戳
   u_int curr_ts;
-  // 窗口大小
   u_int wscale;
 
   // 指向一个链表，该链表中的每一个节点都是一个tcp报文

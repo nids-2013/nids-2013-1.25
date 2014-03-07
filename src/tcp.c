@@ -61,6 +61,21 @@ static struct tcp_stream *free_streams;
 static struct ip *ugly_iphdr;
 struct tcp_timeout *nids_tcp_timeouts = 0;
 
+
+/**
+	入参:
+		h : 需要净化的半连接。
+
+	功能:
+		将所给的半连接中的list全部清除。
+
+	注意:
+		这个函数与后面的prune_queue函数非常相似。
+		那个函数有两个参数，那个函数是在list满了的情况下将list清空。
+		而且会调用警报函数，所以需要增加一个this_tcphdr作为参数。
+
+	- By shashibici 2014/03/07
+**/
 static void purge_queue(struct half_stream * h)
 {
 	struct skbuff *tmp, *p = h->list;
@@ -74,8 +89,9 @@ static void purge_queue(struct half_stream * h)
 		p = tmp;
 	}
 
-	// 初始化为0
+	// 设置为空
 	h->list = h->listtail = 0;
+	// list占用的真实大小也设为0
 	h->rmem_alloc = 0;
 }
 
@@ -294,7 +310,7 @@ static int get_wscale(struct tcphdr * this_tcphdr, unsigned int * ws)
 
 
 
-//
+// 生成一个新的tcp节点，并且把这个节点挂到hash表上。
 static void
 add_new_tcp(struct tcphdr * this_tcphdr, struct ip * this_iphdr)
 {
@@ -591,7 +607,30 @@ ride_lurkers(struct tcp_stream * a_tcp, char mask)
 }
 
 
+/**
+	入参:
+		a_tcp : 触发回调的tcp链接
+		rcv   : 触发回调的接收者
 
+	功能:
+		分两种情况讨论:
+		1、如果有紧急报文。
+		- 设置whatto为紧急报文标志，以告诉ride_lurker回调的目的是处理紧急报文。
+		- 然后调用ride_lurker函数进行用户注册函数的回调。
+		- 检查listener链表看是否有监听者需要删除，此删除不可逆。
+		
+		2、如果没有紧急报文
+		- 设置whatto为正常报文标志，以高速ride_lurker回调的目的是处理正常报文。
+		- 然后调用ride_lurker函数进行用户注册函数的回调。
+		- 检查listener链表看是否有监听者需要删除，次删除不可逆。
+
+	注意:
+		在2、中，虽然有一个while循环，但是默认地，这个循环只会执行一次，
+		而且不鼓励将one_loop_less设为非0.
+
+	- By shashibici 2014/03/07
+	
+**/
 static void
 notify(struct tcp_stream * a_tcp, struct half_stream * rcv)
 {
@@ -659,8 +698,10 @@ prune_listeners:
 	prev_addr = &a_tcp->listeners;
 	i = a_tcp->listeners;
 
-	// 遍历所有的listener,如果listener为空，则释放，否则跳过
+	// 遍历所有的listener,
+	// 如果有某个listener的whatto为0，说明它已经没有用了，那么要删掉
 	while (i)
+	{
 		if (!i->whatto)
 		{
 			*prev_addr = i->next;
@@ -672,6 +713,7 @@ prune_listeners:
 			prev_addr = &i->next;
 			i = i->next;
 		}
+	}
 }
 
 
@@ -692,10 +734,27 @@ prune_listeners:
 		to_copy : 记录紧急指针之前有多少正常的数据
 		to_copy2: 记录紧急指针之后又多少正常的数据
 
-		函数首先判断了当前报文中是否含有合法、有效的紧急数据。
-		如果有，函数会先将紧急报文前的有效内容拷贝到buffer中，然后处理紧急数据，
-	然后再将紧急报文后的有效内容拷贝到buffer中；
-		如果没有，函数会直接将当前报文中的有效数据拷贝到buffer中。
+		函数的执行分为两大分支:
+			(1)该报文包含合法有效的紧急报文;
+			(2)该报文没有包含合法有效的紧急报文;
+
+		下面分情况解释这两种情况下函数的行为:
+		1、收到的报文包含合法有效的紧急报文。
+			在这种情况下，函数会用三个主要步骤来处理这个报文:
+			1) 先处理紧急报文之前的有效数据。将这部分数据添加到
+			   data所指向的缓存中，然后调用notify函数。
+			2) 然后处理紧急报文数据。将这部分数据拷贝到data所指向
+			   的缓存中，然后调用notify函数。
+			3) 最后处理紧急报文后的有效数据。将这部分数据添加到
+			   data所指向的缓存中，然后调用notify函数。
+		2、收到的报文没有包含合法有效的紧急报文。
+			在这种情况下，函数会直接将有效数据添加到data所指向的
+			缓存中，然后调用notify函数。
+
+		最后在数据被处理完了之后，函数会执行一个listener清除，将
+		whatto为0的listener清除，此操作不可逆。
+		也就是说如果一个listener被删除了，那么在这个tcp链接生命周期内都不会
+		再次被添加进来了。
 
 	注:  "有效内容"是指，在确认序列之后的那些字节序内容，已经被确认了的内容
 		不算"有效内容"。
@@ -743,7 +802,7 @@ add_from_skb(struct tcp_stream * a_tcp, struct half_stream * rcv,
 				add2buf(rcv, (char *)(data + lost), to_copy);
 				notify(a_tcp, rcv);
 			}
-			// 否则表示接收端不接受正常数据
+			// 否则表示接收端不接受正常数据，即不调用notify函数
 			else
 			{
 				// 只是把正常数据的数量记录一下，没有添加到buffer中
@@ -763,7 +822,7 @@ add_from_skb(struct tcp_stream * a_tcp, struct half_stream * rcv,
 		rcv->urgdata = data[rcv->urg_ptr - this_seq];
 		// 标记有新的紧急数据到来
 		rcv->count_new_urg = 1;
-		// 调用通知函数
+		// 调用notify函数，该函数最终会调用用户注册的回调函数
 		notify(a_tcp, rcv);
 		// 调用完通知函数，重新设置紧急标志
 		rcv->count_new_urg = 0;
@@ -780,9 +839,12 @@ add_from_skb(struct tcp_stream * a_tcp, struct half_stream * rcv,
 			if (rcv->collect)
 			{
 				add2buf(rcv, (char *)(data + lost + to_copy + 1), to_copy2);
+				// 再次调用notify函数，该函数最终会回调用户的注册函数
+				// 请注意，此时rcv->count_urg_new 为0。
+				// 会被当成普通报文处理
 				notify(a_tcp, rcv);
 			}
-			// 否则只做统计，不拷贝
+			// 否则只做统计，不拷贝，也不调用回调函数
 			else
 			{
 				rcv->count += to_copy2;
@@ -802,9 +864,11 @@ add_from_skb(struct tcp_stream * a_tcp, struct half_stream * rcv,
 			if (rcv->collect)
 			{
 				add2buf(rcv, (char *)(data + lost), datalen - lost);
+				// 没有合法的紧急报文，那么就当做是普通报文调用notify.
+				// 注意，此时rcv->count_urg_new为0.
 				notify(a_tcp, rcv);
 			}
-			// 否则接收者不接受正常报文
+			// 否则接收者不接受正常报文，不拷贝也不回调用户注册的函数
 			else
 			{
 				rcv->count += datalen - lost;
@@ -816,7 +880,8 @@ add_from_skb(struct tcp_stream * a_tcp, struct half_stream * rcv,
 	/*  上面的过程是将报文依据 "是否包含紧急报文" 这个标准，做了分情况处理
 		处理的结果，主要是将刚刚收到的有效报文拷贝到buffer中.
 
-		下面将是具体解析这个报文，判断是否包含"挥手"信息
+		下面将是具体解析这个报文，判断是否包含"挥手"信息，然后做具体处理
+		例如设置一下snd->state和rcv->state.
 	*/
 	
 	if (fin)
@@ -913,15 +978,26 @@ tcp_queue(struct tcp_stream * a_tcp, struct tcphdr * this_tcphdr,
 					             pakiet->urg_ptr + pakiet->seq - 1);
 				}
 				rcv->rmem_alloc -= pakiet->truesize;
+				// 如果找打的包，前驱不为空，说明不是第一个包
 				if (pakiet->prev)
+				{
 					pakiet->prev->next = pakiet->next;
+				}
+				// 否则说明是第一个
 				else
+				{
 					rcv->list = pakiet->next;
+				}
+				// 如果后面不为空，说明不是最后一个
 				if (pakiet->next)
+				{
 					pakiet->next->prev = pakiet->prev;
+				}
+				// 否则是最后一个
 				else
+				{
 					rcv->listtail = pakiet->prev;
-				
+				}
 				tmp = pakiet->next;
 				free(pakiet->data);
 				free(pakiet);
@@ -1018,6 +1094,22 @@ tcp_queue(struct tcp_stream * a_tcp, struct tcphdr * this_tcphdr,
 	}
 }
 
+
+/**
+	入参:
+		rcv :         报文接收者
+		this_tcphdr : 当前收到的报文的头
+
+	功能:
+		将rcv中的list链表全部删除，原因是list队列满了。
+		
+	注意:
+		这个函数与tcp.c开头的一个purge_queue函数非常相似，千万不要弄错。
+		那个函数只有一个参数，那就是需要"净化"的半连接，那个函数不会发出报警
+		所以不需要tcp头。
+
+	- By shashibici 2014/03/07
+**/
 
 static void
 prune_queue(struct half_stream * rcv, struct tcphdr * this_tcphdr)
@@ -1179,8 +1271,11 @@ void tcp_exit(void)
 void
 process_tcp(u_char * data, int skblen)
 {
-//http://blog.sina.com.cn/s/blog_5ceeb9ea0100wy0h.html
-//tcp头部数据结构
+
+	/*************   首先进行tcp报文完整性检测   ***************/
+	
+    //http://blog.sina.com.cn/s/blog_5ceeb9ea0100wy0h.html
+    //tcp头部数据结构
 	struct ip *this_iphdr = (struct ip *)data;
 	struct tcphdr *this_tcphdr = (struct tcphdr *)(data + 4 * this_iphdr->ip_hl);
 	int datalen, iplen;
@@ -1231,10 +1326,10 @@ process_tcp(u_char * data, int skblen)
 		                   this_tcphdr);
 		//return;
 	}
-#if 0
-	check_flags(this_iphdr, this_tcphdr);
-//ECN
-#endif
+
+	
+	 /*************    下面开始判断是否第一次握手     ***************/
+
 	if (!(a_tcp = find_stream(this_tcphdr, this_iphdr, &from_client)))
 	{
 		// 找到hash表中的tcp
@@ -1245,6 +1340,8 @@ process_tcp(u_char * data, int skblen)
 			add_new_tcp(this_tcphdr, this_iphdr);//
 		return;
 	}
+
+	/*************    下面开始判断是否第二次握手     ***************/
 
 	// 否则如果执行这里，就说明已经存在了一个tcp
 	// 识别并记录发送方与接收方
@@ -1258,7 +1355,6 @@ process_tcp(u_char * data, int skblen)
 		rcv = &a_tcp->client;
 		snd = &a_tcp->server;
 	}
-
 
 	// 第二次握手协议都会执行这一段
 	if ((this_tcphdr->th_flags & TH_SYN))  //如果SYN==1 表示同步信号
@@ -1295,7 +1391,7 @@ process_tcp(u_char * data, int skblen)
 		// 序列不是想要的，也会返回
 		// seq 作为下一个将要发送的序号(每次更新之后会等于对方的ack)
 		// 如果不是按序发送，则返回。
-		if (a_tcp->client.seq != ntohl(this_tcphdr->th_ack))//不是想要的序列，丢弃
+		if (a_tcp->client.seq != ntohl(this_tcphdr->th_ack))
 			return;
 
 		// 否则不返回，执行下面语句
@@ -1345,6 +1441,8 @@ process_tcp(u_char * data, int skblen)
 	}
 	// 以上一个if是第二次握手
 
+	/*************    下面开始判断是否第三次握手     ***************/
+	
 	//--------------------------------
 	// 否则执行下面代码,不是第一次也不是第二次握手
 	// 不满足一些条件，就return
@@ -1359,10 +1457,8 @@ process_tcp(u_char * data, int skblen)
 	)
 		// 那么丢弃
 		return;
-
 	
 	// 否则不返回
-
 	
 	// 如果有严重错误而导致reset则执行下面代码
 	if ((this_tcphdr->th_flags & TH_RST))
@@ -1389,30 +1485,41 @@ process_tcp(u_char * data, int skblen)
 	        before(tmp_ts, snd->curr_ts))
 		return;
 
-	// 
+	// 首先判断，这个tcp报文必须包含应答信息
 	if ((this_tcphdr->th_flags & TH_ACK))
 	{
-		// 如果是第三次握手连接,可以开始发数据了
+		// 这个if如果成立，则唯一确定了必须是第三次握手
+		// 参考: TCP-IP 详解卷1第18章
 		if (from_client && a_tcp->client.state == TCP_SYN_SENT &&
 		        a_tcp->server.state == TCP_SYN_RECV)
 		{
-
-			// 
+			// 如果应答序号是正确的，才会执行下面的if语句
 			if (ntohl(this_tcphdr->th_ack) == a_tcp->server.seq)
 			{
 				// 修改客户端的状态
 				a_tcp->client.state = TCP_ESTABLISHED;
 				// 把包中的ack记录下来，放到client中
 				a_tcp->client.ack_seq = ntohl(this_tcphdr->th_ack);
-				// 跟新tcp的时间戳
+				// 更新tcp的时间戳
 				a_tcp->ts = nids_last_pcap_header->ts.tv_sec;
 
-				/**
-					下面这一段加了花括号代码的功能:
+				/*********************************************************************
+				下面这一段加了花括号代码的功能:
+					首先必须明确，libnids一定是收到了一个来自client的第三次握手报文才会
+					执行下面这一段代码，收到其他时候的报文都不会执行下面的代码的。
 
+					所以可以这么理解，下面的代码是一个tcp链接刚刚建立的时候，第一次调用
+					用户注册的回调函数。
 
+					tcp链接在建立时，第一次握手和第二次握手不会回调用户注册的函数。
 					
-				**/
+					tcp在第三次握手之前，如果有一方发出reset信号，也会回调用户注册的函数
+					但是在那之后，整个tcp都会被销毁。
+
+					下面这段代码就是遍历一次用户注册的回调函数，每遍历一个，就将它添加到
+					listener链表中。主要有for循环实现。
+				***********************************************************************/
+				
 				// 为什么这里需要加大括号?
 				// 因为需要使用局部变量 i j data
 				{
@@ -1438,9 +1545,29 @@ process_tcp(u_char * data, int skblen)
 						char ccu = a_tcp->client.collect_urg;
 						char scu = a_tcp->server.collect_urg;
 
-						/* 执行用户注册的某一个tcp回调函数
-						   这一句表明，每收到一个tcp报文就会立即回调一次
-						   用户注册的回调函数。*/
+						/**
+							这是用户注册的函数第一次被调用
+							而且请注意此时 a_tcp->nids_state = NIDS_JUST_EST;
+							所以在用户的回调函数中，需要有类似如下语句
+								if (a_tcp->nids_state == NIDS_JUST_EST)
+								{
+									这里填写本注册函数的操作目的，例如专门处理urg报文，
+									那么只需要将a_tcp->client.collect_urg++ 以及
+									a_tcp->server.collect_urg++即可。
+								}
+							如果没有在一开始的时候，把目的说清楚，那么这个回调函数
+							就不会被注册到libnids当中，今后是永远不会被回调的，只有在
+							一开始的时候被回调一下。
+
+							另外，如果在后续的处理当中，把某个注册函数中的所有目的指标
+							都清除了，那么这个回调函数就会被彻底清除，以后再也无法被回调了。
+							在上述例子中，如果将 a_tcp->client.collect_urg 与
+							a_tcp->server.collect_urg都减少，并且没有其他的变量被设置，
+							那么libnids会认为这个注册函数已经没有利用价值了，于是会从
+							listener链表中除掉，以后再也没有机会加到listener链表中了，
+							除非建立了一个新的tcp链接。(参考 notify函数)
+							
+						**/
 						(i->item) (a_tcp, &data);
 
 						/* 根据用户回调函数的修改，判断用户需要做什么事，从而
@@ -1460,7 +1587,6 @@ process_tcp(u_char * data, int skblen)
 							whatto |= COLLECT_sc; 
 						if (scu < a_tcp->server.collect_urg)
 							whatto |= COLLECT_scu;
-
 
 						// 默认为假,不执行
 						if (nids_params.one_loop_less)
@@ -1506,7 +1632,11 @@ process_tcp(u_char * data, int skblen)
 					a_tcp->nids_state = NIDS_DATA;
 				}
 				/**
-					注意上面这一段加了花括号的代码
+					注意上面这一段加了花括号的代码，正常执行完毕之后会将
+					a_tcp的状态改为NIDS_DATA,说明已经收到而来一个报文
+					当然这个报文已经被回调函数处理了。
+					这个状态只是为了给后续libnids接收报文做一个标志--说明这个tcp
+					已经完成了握手阶段，进入数据传输阶段了。
 				**/
 				
 			}
@@ -1519,11 +1649,52 @@ process_tcp(u_char * data, int skblen)
 	/**
 	   注意: 执行完上述语句，process_tcp并没有结束。
 
-	   - 首先，上述过程执行之后，用户注册的回调函数已经被执行了。
+	   - 首先，上述过程执行之后，如果是第三次握手的话用户注册的回调函数已经被执行了。
 	   - 然后才执行下面的代码，下面的代码是将刚刚接收到的这个tcp报文
 	     进行判断，是否需要保存到a_tcp的缓冲区中，或者是否是挥手报文。
 	**/
+	
 
+	/********** 下面是对数据报文的处理，包含了判断是否四次挥手 ***************/
+	/**
+	从代码上看:
+		- 如果数据报为第一次握手，那么在上面处理完后会return
+		- 如果数据报为第二次握手，那么在上面处理完后也会 return
+		- 如果数据报为第三次握手，那么在上面处理完后不会立即return而会继续往这里执行
+
+	这符合TCP/IP的协议规范:
+		- 第三次握手能够携带数据。
+		- 若第三次握手携带了数据，那么会在这个process_tcp中连续两次回调用户注册函数
+		  具体过程是这样的:
+		  1) 第一次回调的时候，是"第三次握手"这个理由回调，在上面的for循环，在这次
+		     调用时，会设置三个状态(在上述代码的for循环前)。
+		     	a_tcp->client.state = TCP_ESTABLISHED;
+				a_tcp->server.state = TCP_ESTABLISHED;
+				a_tcp->nids_state = NIDS_JUST_EST;
+			 此时回调用户注册函数的结果是，用户认为tcp刚刚建立，会做些初始化工作。
+		  2) 第二次回调的时候，是"收到新报文"这个理由回调，在上面最后一句赋值语句
+		  	 得以体现。
+		  	 	a_tcp->nids_state = NIDS_DATA;
+		  	 正是因为设置了这一个状态，那么在接下来的代码中使用notify回调用户注册
+		  	 的函数时，用户会认为tcp已经建立了，并且当前有一个报文被监听到。
+
+	注: 
+		- 仅在收到的报文是第三次握手时，才会在process_tcp函数中出现两次回调
+		  用户函数的现象，第一次是由上面的for循环完成，第二次有下面的tcp_queue完成。
+		- 在普通情况下，接收到一个报文，在process_tcp函数中仅回调一次用户注册函数。
+		- 在收到第三次握手时报文时，第一次回调用户注册函数的同时，会给这个tcp注册
+		  一个listener链表，链表中每一个节点代表了一个用户注册的函数。如果一个用户
+		  注册函数在这个时候，没有将
+		  		client->collect
+		  		client->urg_collect
+		  		server->collect
+		  		server->urg_collect
+		  四个中的任何一个置位，那么这个用户写的回调函数将不会注册到这个tcp的listener
+		  链表中，而且以后再也没有机会注册这个函数了!!
+		  同样地，如果用户写的回调函数，不慎将这四个变量都设置成了0，那么在一次回调
+		  过后，这个可怜的回调函数就会从listener链表中删除，并且没有机会再添加回去了!!
+		  
+	**/
 
 	// 判断是否满足四次握手
 	// 在这个if中，如果满足了"完成了四次握手"这个条件，则关闭并释放。
@@ -1550,7 +1721,11 @@ process_tcp(u_char * data, int skblen)
 		}
 	}
 
-	
+
+	/**
+		如果上面没有完成四次挥手，那么就会继续往下走，进入下面这个非常关键的if.
+		下面代码的详情请参考 tcp_queue函数注释。
+	**/
 	// 否则不满足四次挥手的条件，那么就要处理这一个报文
 	// 很可能就是放入缓存中。
 	if (datalen + (this_tcphdr->th_flags & TH_FIN) > 0)
