@@ -308,6 +308,7 @@ add_new_tcp(struct tcphdr * this_tcphdr, struct ip * this_iphdr)
 	addr.dest = ntohs(this_tcphdr->th_dport);
 	addr.saddr = this_iphdr->ip_src.s_addr;
 	addr.daddr = this_iphdr->ip_dst.s_addr;
+	
 	hash_index = mk_hash_index(addr);
 
 	// 如果tcp的数量过多
@@ -385,8 +386,24 @@ add_new_tcp(struct tcphdr * this_tcphdr, struct ip * this_iphdr)
 }
 
 
-// rcv可能是接收端
-// 这个函数是将新来的数据，添加到某一个tcp端(client或者server)的缓存中
+/**
+	入参:
+		rcv    : 报文接收者，一个tcp半链接
+		data   : 指向需要加入buffer的数据
+		datalen: 需要加入buffer的数据长度
+
+	功能:
+		分配足够的空间，
+		将参数中data所指向长度为datalen的数据，拷贝到所分配的空间中。
+		这个空间由rcv->data所指向。
+
+	注意: 
+		这个函数修改了rcv->count、rcv->count_new 和 rcv->bufsize
+		其他任何变量都没有修改，包括rcv->offset 或 rcv->urg_ptr等
+		
+	- By shashibici 2014/03/07
+	
+**/
 static void
 add2buf(struct half_stream * rcv, char *data, int datalen)
 {
@@ -394,13 +411,14 @@ add2buf(struct half_stream * rcv, char *data, int datalen)
 
 	// cout - offset 恰好等于当前data中存在的字节数
 	// 如果再添加datalen数量的字节数，需要检测 rcv的buffer是否够大
-	// 如果不够大
+	// 如果不够大,需要额外分配
 	if (datalen + rcv->count - rcv->offset > rcv->bufsize)
 	{
-		// 如果没有分配
+		// 如果还没有给data指针分配空间(这只发生在刚开始时)
 		if (!rcv->data)
 		{
-			// 如果小于2048就当成2048,否则另外计算
+			// 如果当前报文需要保存的内容
+			// 小于2048就当成2048,否则另外计算
 			if (datalen < 2048)
 				toalloc = 4096;
 			else
@@ -408,15 +426,25 @@ add2buf(struct half_stream * rcv, char *data, int datalen)
 			rcv->data = malloc(toalloc);
 			rcv->bufsize = toalloc;
 		}
-		// 否则已经分配了
+		// 否则已经分配了,这发生在收到后续报文的情况
 		else
 		{
-			// 只需要追加分配
+			/* 这个空间分配策略看起来像是一个"二进制递增算法" */
+			
+			// 如果本次需要保存的数据，比当前的总大小要小，
+			// 那么只需要在分配当前那么大的缓存空间即可，
+			// 此情况下，会剩余些许空间留到下一个报文用
 			if (datalen < rcv->bufsize)
+			{
 				toalloc = 2 * rcv->bufsize;
+			}
+			// 否则需要分配更多的空间。
 			else
+			{
 				toalloc = rcv->bufsize + 2*datalen;
-			// realloc重新分配
+			}
+			// realloc重新分配,
+			// 如果堆空间足够，直接在原空间维追加;否则重新生成空间，拷贝并释放原空间
 			rcv->data = realloc(rcv->data, toalloc);
 			rcv->bufsize = toalloc;
 		}
@@ -429,13 +457,95 @@ add2buf(struct half_stream * rcv, char *data, int datalen)
 	// (count-offset)是data中现有的数据量， data+(count-offset)是在现有数据量末尾位置
 	// 所以是将新来的数据，加到末尾
 	memcpy(rcv->data + rcv->count - rcv->offset, data, datalen);
-	// 修改刚刚到来的数据-- count_new
+	// 修改刚刚到来的数据的计数器:count_new
 	rcv->count_new = datalen;
 	rcv->count += datalen;
+
+	/*  注意: 这个函数并没有修改 offset 这个变量，只是修改了 count 这个变量*/
+	
 }
 
 
+/**
+	入参:
+		a_tcp  : 一个tcp链接
+		mask   : 这是一个记号，它的值只能是下面的一种
+				{	
+					COLLECT_cc  = 00000001B, 
+					COLLECT_sc  = 00000010B,
+					COLLECT_ccu = 0000100B,
+					COLLECT_scu = 0001000B
+				}
 
+	功能:
+
+	 1、设想这么一个应用场景:
+	 	
+	 	- 在一个网络入侵检测系统中，攻击者每一次攻击都会不可避免地产生一个
+	 	  紧急报文(包含urg标记的报文)。
+	 	- 检测系统为了在平常的时候减少检测开销，仅仅监听那些包含urg的报文，
+	 	  对于正常的报文并不会收集并处理。
+	 	- 检测系统在收到urg报文之后，会分析该报文的特征，如果符合某个特征，
+	 	  就可以判断发生了网络攻击。
+	 	- 一旦判断发生了网络工具，检测系统为了收集攻击者的更多信息，必须将
+	 	  网络中的所有tcp报文都收集起来，并且做进一步的分析处理。
+
+	 2、在上面的场景中，应用程序(我们可称之为"网警")可能可以按如下思路实现:
+
+		- 每当网络中有一个新的tcp链接建立时，网警会执行语句
+				a_tcp->client.collect_urg++;
+				a_tcp->server.collect_urg++;
+	 	  确保libnids会为他监听该tcp链接中所有包含urg标记的报文
+	 	- 当有一个报文由libnids上传给网警的时候，网警会判断这个报文时候包含
+	 	  urg标记。如果包含urg标记，那么他会解析这个包，依据包的特征决定是否需要
+	 	  启动警报。如果不包含rug标记，说明这是一个正常的包，毫无疑问此时一定是网警
+	 	  已经启动了警报(启动警报以后，libnids才会将正常的包送给网警)，此时需要分析
+	 	  这个正常的包，进一步确定攻击者特征。
+		- 启动警报。当网警发现了一个包含攻击特征的urg报文后，会执行下面语句启动警报
+				a_tcp->client.collect++;
+				a_tcp->server.collect++;
+				alarm = true;
+		- 当一次攻击威胁被解除之后，网警应该解除警报，恢复到仅仅监听包含urg的报文
+		  的状态。他可以执行如下语句来解除警报
+		  		a_tcp->client.collect--;
+		  		a_tcp->server.collect--;
+		  		alarm = false;
+		- 之后网警回复正常，即仅仅监听并处理包含urg的报文
+
+	 3、在上面的场景中，libnids中的ride_lurkers函数是怎样做的呢?
+
+	  	- 每当收到一个属于a_tcp链接的tcp报文，ride_lurkers就会被调用一次。
+	  	- 特别需要注意第二个参数mask,这个参数会根据ride_lurkers被调用的时机
+	  	  和位置的不同有所不同。例如libnids在确收到一个包含urg标记的报文时，
+	  	  会用如下语句进行调用
+	  	  		mask = COLLECT_ccu;
+	  	  		ride_lurkers(a_tcp, mask);
+	  	  上面语句说明，libnids此时收到的一个报文，其接收者是client,而且这个报文
+	  	  是一个包含有urg标记的报文，ride_lurkers函数要做的就是去所有的注册函数中
+	  	  找一下，有哪一个注册函数的whatto域是与mask(此例中即COLLECT_ccu)相一致的，
+	  	  如果找到，就调用这个函数。
+	  	- ride_lurkers在处理某一个注册函数的whatto标志的时候，采用的是"与或开关"法。
+	  	  如果whatto的某一位被置成1，则表明这个注册函数希望处理某一类型对应的报文。
+	  	  例如在上个例子中，
+	  	       mask为COLLECT_ccu(0x04),它和whatto相与，仅当whatto的倒数第三位为1
+	  	       的时候结果才是true,才能够执行if.
+	  	  如果whatto和COLLECT_ccu(0x04)相或，那么就是把whatto的倒数第三位置为1；
+	  	  如果whatto和COLLECT_ccu(0x04)取反相与，那么就是把whatto倒数第三位清0。
+		- 因此每一个lurker_node都能够通过其whatto字段来判断自己适合于处理哪一种
+		  类型的报文，而不适合处理哪一种类型的报文。需要注意的是，每一个lurker_node
+		  节点就代表了一个用户注册的注册函数，其中的item域就是指向用户注册函数的指针。
+
+	注意:
+		lurker_node 和 proc_node的区别。
+		- proc_node仅仅是将用户注册的函数组织了起来。
+		- lurker_node 是针对每一个tcp链接而言的，每一个tcp链接都有一个lurker_node的
+		  链表结构，当该tcp释放了之后，其中的lurker_node将会全部释放。
+		- 可以在这么说，proc_node是每一个注册函数的家，当不同的tcp需要用到同一个注册
+		  函数的时候，这些tcp就需要给注册函数一个临时的家，临时的家就是lurker_node.
+
+	- By shashibic 2014/03/07
+	
+**/
 static void
 ride_lurkers(struct tcp_stream * a_tcp, char mask)
 {
@@ -445,16 +555,21 @@ ride_lurkers(struct tcp_stream * a_tcp, char mask)
 
 	// 遍历所有的监听这
 	for (i = a_tcp->listeners; i; i = i->next)
+		// 如果当前监听者i 的whatto 与 mask 相一致(相与后为1)
+		// 那么当前监听者就是处理这个mask所对应的动作的。
 		if (i->whatto & mask)
 		{
+			// 下面这几个变量: cc、sc、ccu、scu要么为0，要么为1
 			cc = a_tcp->client.collect;
 			sc = a_tcp->server.collect;
 			ccu = a_tcp->client.collect_urg;
 			scu = a_tcp->server.collect_urg;
 
-			// 执行监听者函数
+			// 执行监听者函数，它其实就是用户注册的某一个函数
 			(i->item) (a_tcp, &i->data);
-			
+
+			// 再次判断a_tcp中相应的标记是否变化。
+			// 下面的if条件成立说明:用户将相应的值增加了
 			if (cc < a_tcp->client.collect)
 				i->whatto |= COLLECT_cc;
 			if (ccu < a_tcp->client.collect_urg)
@@ -463,6 +578,7 @@ ride_lurkers(struct tcp_stream * a_tcp, char mask)
 				i->whatto |= COLLECT_sc;
 			if (scu < a_tcp->server.collect_urg)
 				i->whatto |= COLLECT_scu;
+			// 下面的if条件成立说明:用户减少了相应的值
 			if (cc > a_tcp->client.collect)
 				i->whatto &= ~COLLECT_cc;
 			if (ccu > a_tcp->client.collect_urg)
@@ -498,7 +614,7 @@ notify(struct tcp_stream * a_tcp, struct half_stream * rcv)
 		// 跳转到"删除listeners", 不执行下面的if
 		goto prune_listeners;
 	}
-	// 如果有新的包
+	// 如果接收者对正常的报文感兴趣，那么执行对正常报文的处理
 	if (rcv->collect)
 	{
 		if (rcv == &a_tcp->client)
@@ -508,24 +624,33 @@ notify(struct tcp_stream * a_tcp, struct half_stream * rcv)
 		do
 		{
 			int total;
-			// 在buffer中的数量
+			// 首先计算当前buffer中的字节数量(count-offset)
+			// 然后记录下这个数值
 			a_tcp->read = rcv->count - rcv->offset;
 			total=a_tcp->read;
 
-			// 设置mask
+			/*
+				这里需要特别注意，ride_lurkers会回调用户的注册函数。
+				于是在用户注册的函数中，就有可能修改a_tcp->read这个数值。
+				例如，若用户读取了n个字节，那么这个a_tcp->read就有可能修改为n。
+			*/
 			ride_lurkers(a_tcp, mask);
+			
 			// 如果count_new>0
-			if (a_tcp->read>total-rcv->count_new)
-				rcv->count_new=total-a_tcp->read;
+			if (a_tcp->read > (total - rcv->count_new))
+				rcv->count_new = total-a_tcp->read;
 			// 把data向后read为起始地址的内容，移动到data处
 			if (a_tcp->read > 0)
 			{
-				memmove(rcv->data, rcv->data + a_tcp->read, rcv->count - rcv->offset - a_tcp->read);
+				memmove(rcv->data, rcv->data + a_tcp->read, 
+					    rcv->count - rcv->offset - a_tcp->read);
+				
 				rcv->offset += a_tcp->read;
 			}
 		}
+		/* 注意: one_loop_less 默认情况下为0，也就是不会循环执行*/
 		while (nids_params.one_loop_less && a_tcp->read>0 && rcv->count_new);
-// we know that if one_loop_less!=0, we have only one callback to notify
+		// we know that if one_loop_less!=0, we have only one callback to notify
 		// 移动完了之后 设置count_new
 		rcv->count_new=0;
 	}
@@ -550,56 +675,114 @@ prune_listeners:
 }
 
 
+/**
+	入参:
+		a_tcp   : 当前正在处理的tcp
+		rcv     : 接收者，半tcp
+		snd     : 发送者，半tcp
+		data    : 指向报文的指针
+		datalen : 整个报文的长度，或者是data的有效长度
+		this_seq: 从报文头抽取出来的，当前报文第一个字节的序号
+		fin     : 从报文头抽取出来的，当前报文的fin标记
+		urg     : 从报文头抽取出来的，当前报文的urg标记
+		urg_prt : 从报文头抽取出来的，当前报文的urg_prt的值
 
+	功能:
+		lost    : 记录前面有多少字节已经是被确认过的
+		to_copy : 记录紧急指针之前有多少正常的数据
+		to_copy2: 记录紧急指针之后又多少正常的数据
+
+		函数首先判断了当前报文中是否含有合法、有效的紧急数据。
+		如果有，函数会先将紧急报文前的有效内容拷贝到buffer中，然后处理紧急数据，
+	然后再将紧急报文后的有效内容拷贝到buffer中；
+		如果没有，函数会直接将当前报文中的有效数据拷贝到buffer中。
+
+	注:  "有效内容"是指，在确认序列之后的那些字节序内容，已经被确认了的内容
+		不算"有效内容"。
+
+	- By shashibici. 2014/03/07.
+
+**/
 static void
 add_from_skb(struct tcp_stream * a_tcp, struct half_stream * rcv,
              struct half_stream * snd,
              u_char *data, int datalen,
              u_int this_seq, char fin, char urg, u_int urg_ptr)
 {
-	// 记录丢包数量
+	// 记录本报文中需要丢掉多少字节
 	u_int lost = EXP_SEQ - this_seq;
 	int to_copy, to_copy2;
 
-	// after函数:检查前一个参数是否比后一个参数大
+	// 如果是一个紧急包，而且紧急指针的指向的位置是我们所期待的，
+	// 而且 (接收者还没有发现这个紧急报文， 或者紧急指针比原来紧急指针还要大)
+	// 那么执行下面的if条件，更新urg_seen 以及 urg_ptr.
 	if (urg && after(urg_ptr, EXP_SEQ - 1) &&
 	        (!rcv->urg_seen || after(urg_ptr, rcv->urg_ptr)))
 	{
 		rcv->urg_ptr = urg_ptr;
 		rcv->urg_seen = 1;
 	}
-	
+
+	// 如果接收者看到了这个紧急报文 &&
+	// 紧急报文的开始在扔掉的那一部分报文之后，即这是我们需要的紧急报文内容 &&
+	// 紧急指针不超过当前报文
 	if (rcv->urg_seen && after(rcv->urg_ptr + 1, this_seq + lost) &&
 	        before(rcv->urg_ptr, this_seq + datalen))
 	{
+		// 首先计算紧急内容之前的有效内容
 		to_copy = rcv->urg_ptr - (this_seq + lost);
+		// 如果有内容需要拷贝
 		if (to_copy > 0)
 		{
+			// collect变量用来记录是否接受正常的报文
+			// 非0表示接受，0表示不接受正常报文
 			if (rcv->collect)
 			{
+				// 如果接收，则把当前包中，紧急指针之前的内容添加到buffer中
+				// 这个buffer是half_stream中的一个data指针所指向的内存
 				add2buf(rcv, (char *)(data + lost), to_copy);
 				notify(a_tcp, rcv);
 			}
+			// 否则表示接收端不接受正常数据
 			else
 			{
+				// 只是把正常数据的数量记录一下，没有添加到buffer中
 				rcv->count += to_copy;
+				// 修改offset标记
 				rcv->offset = rcv->count; /* clear the buffer */
 			}
 		}
+
+		/* 经过以上过程，已经将紧急指针之前的正常内容拷贝到了buffer中了*/
+
+		// 将rcv->urgdata指向真正的紧急数据开始的位置
+		// 下面这个写法等价于:
+		/*
+			rcv->urgdata = data+(rcv->urg_ptr - this_seq);
+		*/
 		rcv->urgdata = data[rcv->urg_ptr - this_seq];
+		// 标记有新的紧急数据到来
 		rcv->count_new_urg = 1;
+		// 调用通知函数
 		notify(a_tcp, rcv);
+		// 调用完通知函数，重新设置紧急标志
 		rcv->count_new_urg = 0;
+		// 设置为"接收者没有看到紧急数据"，即为下一个包做准备
 		rcv->urg_seen = 0;
+		// 修改紧急报文计数器
 		rcv->urg_count++;
+		// 计算紧急报文指针后面还有多少字节需要拷贝
 		to_copy2 = this_seq + datalen - rcv->urg_ptr - 1;
+		// 如果有字节需要拷贝
 		if (to_copy2 > 0)
 		{
+			// 如果接收者需要接受正常报文，那么则拷贝
 			if (rcv->collect)
 			{
 				add2buf(rcv, (char *)(data + lost + to_copy + 1), to_copy2);
 				notify(a_tcp, rcv);
 			}
+			// 否则只做统计，不拷贝
 			else
 			{
 				rcv->count += to_copy2;
@@ -607,15 +790,21 @@ add_from_skb(struct tcp_stream * a_tcp, struct half_stream * rcv,
 			}
 		}
 	}
+
+	// 否则当前报文没有包含合法有效的 "紧急内容"
+	// 当做正常报文处理
 	else
 	{
+		// 如果出去丢掉的内容，还有内容
 		if (datalen - lost > 0)
 		{
+			// 如果接收者需要接受正常报文
 			if (rcv->collect)
 			{
 				add2buf(rcv, (char *)(data + lost), datalen - lost);
 				notify(a_tcp, rcv);
 			}
+			// 否则接收者不接受正常报文
 			else
 			{
 				rcv->count += datalen - lost;
@@ -623,16 +812,53 @@ add_from_skb(struct tcp_stream * a_tcp, struct half_stream * rcv,
 			}
 		}
 	}
+
+	/*  上面的过程是将报文依据 "是否包含紧急报文" 这个标准，做了分情况处理
+		处理的结果，主要是将刚刚收到的有效报文拷贝到buffer中.
+
+		下面将是具体解析这个报文，判断是否包含"挥手"信息
+	*/
+	
 	if (fin)
 	{
+		// 如果包含挥手信息，说明发送者已经发送了
 		snd->state = FIN_SENT;
+		// 如果接收者已经为TCP_CLOSING 说明接收者也已经发送过fin了
+		// 那么就是等待关闭整个tcp
 		if (rcv->state == TCP_CLOSING)
 			add_tcp_closing_timeout(a_tcp);
 	}
 }
 
 
+/**
+	入参:
+		a_tcp        需要处理的tcp链接
+		this_tcphdr  指向刚捕获的tcp报文头部的指针
+		sed          发送者
+		rcv          接收者
+		data         指向刚捕获的tcp报文内容起始地址的指针
+		datalen      需要申请的空间大小
+		skblen       刚刚捕获的tcp报文的内容的长度
 
+	功能:
+		分情况，将刚刚捕获的tcp报文内容添加到rcv中。
+		rcv有两个指针会用到，分别是"char *data" 和 "skbuff *list"
+		data指针指向的是已经被确认了的tcp报文，
+		list是一个链表头，该链表其实就是接收方的缓冲窗口，存放的是接收到但是没有
+		被确认的报文。
+
+	注意:
+		该函数对接收到的报文分三种情况讨论。
+		1)	接收到的报文的序号小于接收方上一次ack的序号，也就说收到了一个已经被确认
+			过了的报文。
+		2) 	接收到的报文的序号小于接收方上一次ack的序号，但是加上报文的长度之后，
+			其序号超过接收方上一次ack的序号，也就是说这个报文中有一部分没有被确认。
+		3)	接收到的报文序号大于或等于接收方上一次ack的序号，也就是说收到了一个
+			报文，该报文是等待确认的报文。
+
+	- By shashibici 2014/03/07.
+**/
 static void
 tcp_queue(struct tcp_stream * a_tcp, struct tcphdr * this_tcphdr,
           struct half_stream * snd, struct half_stream * rcv,
@@ -646,8 +872,16 @@ tcp_queue(struct tcp_stream * a_tcp, struct tcphdr * this_tcphdr,
 	 * Did we get anything new to ack?
 	 */
 
+	// EXP_SEQ表示接收方期望的发送方序列号。
+	// this_seq是刚刚捕获的这个包的序列号。
+	// if (this_seq < EXP_SEQ)表示，当前抓到的包是一个重发的包。
+	// if (this_seq == EXP_SEQ) 表示，当前抓到的包是一个期望的包。
 	if (!after(this_seq, EXP_SEQ))
 	{
+		// 如果 当前报文的序号+报文的长度+(1或0) > 上一次发出的ack
+		// 说明 这个包有一部分需要处理，即添加到rcv->data中
+		// 注意: 这个"一部分"的长度恰好就是 this_seq + datalen - EXP_SEQ,
+		// 如果this_seq == EXP_SEQ 那么就是整个报文都需要添加到rcv->data中
 		if (after(this_seq + datalen + (this_tcphdr->th_flags & TH_FIN), EXP_SEQ))
 		{
 			/* the packet straddles our window end */
@@ -661,10 +895,17 @@ tcp_queue(struct tcp_stream * a_tcp, struct tcphdr * this_tcphdr,
 			 * made visible? (Go forward from skb)
 			 */
 			pakiet = rcv->list;
+			// 遍历rec->list链表，如果遇到不感兴趣的包直接清理掉；
+			// 遇到部分感兴趣的包，留下感兴趣的部分然后清理掉；
+			// 一直到遇到一个完全感兴趣的包，退出遍历。
+			// "感兴趣"是指包的起始序号大于被确认过的序号(该包完全没被确认)
+			// "部分感兴趣"是指包的前一部分已被确认而后半部分没被确认。
+			// "不感兴趣"是指整个包已经被确认过。
 			while (pakiet)
 			{
 				if (after(pakiet->seq, EXP_SEQ))
 					break;
+				// 如果第一个参数 大于 第二个参数 则为真，执行if.
 				if (after(pakiet->seq + pakiet->len + pakiet->fin, EXP_SEQ))
 				{
 					add_from_skb(a_tcp, rcv, snd, pakiet->data,
@@ -680,6 +921,7 @@ tcp_queue(struct tcp_stream * a_tcp, struct tcphdr * this_tcphdr,
 					pakiet->next->prev = pakiet->prev;
 				else
 					rcv->listtail = pakiet->prev;
+				
 				tmp = pakiet->next;
 				free(pakiet->data);
 				free(pakiet);
@@ -687,20 +929,33 @@ tcp_queue(struct tcp_stream * a_tcp, struct tcphdr * this_tcphdr,
 			}
 		}
 		else
+		{
+			// !after((this_seq, EXP_SEQ))为真  并且
+			// after(this_seq + datalen + (this_tcphdr->th_flags & TH_FIN), EXP_SEQ) 为假
+			// 表示完全不感兴趣,直接返回。
 			return;
+		}
+		
 	}
+	// 这个else中处理 "完全感兴趣"的包。
 	else
 	{
 		struct skbuff *p = rcv->listtail;
 
 		pakiet = mknew(struct skbuff);
+		// 真实的数据长度
 		pakiet->truesize = skblen;
 		rcv->rmem_alloc += pakiet->truesize;
+		// 这一个包占的长度
 		pakiet->len = datalen;
+		// 分配一个包所占的长度的空间
 		pakiet->data = malloc(datalen);
+		// 如果非配失败则打印错误(并退出)
 		if (!pakiet->data)
 			nids_params.no_mem("tcp_queue");
+		// 否则拷贝数据
 		memcpy(pakiet->data, data, datalen);
+		// 设置挥手标志
 		pakiet->fin = (this_tcphdr->th_flags & TH_FIN);
 		/* Some Cisco - at least - hardware accept to close a TCP connection
 		 * even though packets were lost before the first TCP FIN packet and
@@ -710,23 +965,36 @@ tcp_queue(struct tcp_stream * a_tcp, struct tcphdr * this_tcphdr,
 		 * corresponding libnids resources can be released instead of waiting
 		 * for retransmissions which will never happen.  -- Sebastien Raveau
 		 */
+		 // 如果这是一个挥手
 		if (pakiet->fin)
 		{
+			// 设置发送者状态为关闭
 			snd->state = TCP_CLOSING;
+			// 如果接收方已经发送了挥手 或者 接收方已经确认了挥手
 			if (rcv->state == FIN_SENT || rcv->state == FIN_CONFIRMED)
+				// 会将这个tcp放到一个等待关闭队列中。计时器到了就会关闭
 				add_tcp_closing_timeout(a_tcp);
 		}
+		// 设置标志
 		pakiet->seq = this_seq;
 		pakiet->urg = (this_tcphdr->th_flags & TH_URG);
 		pakiet->urg_ptr = ntohs(this_tcphdr->th_urp);
+		// 将当前的报文包插入到list合适的位置，使得seq递增有序
 		for (;;)
 		{
+			// 如果来到了队头，或者 发现了一个list节点p,它的seq不超过当前seq
 			if (!p || !after(p->seq, this_seq))
+				// 那么就终止循环
 				break;
+			// 否则由队尾向队头继续搜索
 			p = p->prev;
 		}
+
+		// 如果是空，表示这一个刚收到的包，比原来list中所有包的seq都小
+		// 所以应该插在队头
 		if (!p)
 		{
+			// 将当前包插入到合适的位置
 			pakiet->prev = 0;
 			pakiet->next = rcv->list;
 			if (rcv->list)
@@ -735,6 +1003,8 @@ tcp_queue(struct tcp_stream * a_tcp, struct tcphdr * this_tcphdr,
 			if (!rcv->listtail)
 				rcv->listtail = pakiet;
 		}
+		// 否则不是空，那么一定找到了一个合适的位置
+		// 所以插入到合适的位置
 		else
 		{
 			pakiet->next = p->next;
@@ -807,6 +1077,7 @@ find_stream(struct tcphdr * this_tcphdr, struct ip * this_iphdr,
 		*from_client = 1;
 		return a_tcp;
 	}
+	
 	reversed.source = ntohs(this_tcphdr->th_dport);
 	reversed.dest = ntohs(this_tcphdr->th_sport);
 	reversed.saddr = this_iphdr->ip_dst.s_addr;
@@ -903,6 +1174,8 @@ void tcp_exit(void)
 //   8、在process_tcp函数中，会解析这是怎样的一个tcp，然后进行相应的操作。
 //      并且会在适当是时候调用 tcp的listeners以及 用户注册的tcp回调函数
 //
+//   - By shashibic 2014/03/07
+//
 void
 process_tcp(u_char * data, int skblen)
 {
@@ -939,7 +1212,7 @@ process_tcp(u_char * data, int skblen)
 		                   this_tcphdr);
 		return;
 	} // ktos sie bawi
-//如果原ip和目的ip都为0
+    //如果原ip和目的ip都为0
 	if ((this_iphdr->ip_src.s_addr | this_iphdr->ip_dst.s_addr) == 0)
 	{
 		nids_params.syslog(NIDS_WARN_TCP, NIDS_WARN_TCP_HDR, this_iphdr,
@@ -964,14 +1237,17 @@ process_tcp(u_char * data, int skblen)
 #endif
 	if (!(a_tcp = find_stream(this_tcphdr, this_iphdr, &from_client)))
 	{
-		//找到hash表中的tcp
-		//猜测第一次握手
+		// 找到hash表中的tcp
+		// 如果进来执行，呢么就是第一次握手
 		if ((this_tcphdr->th_flags & TH_SYN) &&
 		        !(this_tcphdr->th_flags & TH_ACK) &&
 		        !(this_tcphdr->th_flags & TH_RST))
 			add_new_tcp(this_tcphdr, this_iphdr);//
 		return;
 	}
+
+	// 否则如果执行这里，就说明已经存在了一个tcp
+	// 识别并记录发送方与接收方
 	if (from_client)  //如果来自用户
 	{
 		snd = &a_tcp->client;//client为发送方
@@ -984,9 +1260,10 @@ process_tcp(u_char * data, int skblen)
 	}
 
 
-	// 第一次或者第二次握手协议都会执行这一段
+	// 第二次握手协议都会执行这一段
 	if ((this_tcphdr->th_flags & TH_SYN))  //如果SYN==1 表示同步信号
 	{
+		// 如果来自client 那么就是重复的第一次握手。
 		if (from_client)
 		{
 			// if timeout since previous
@@ -1005,13 +1282,19 @@ process_tcp(u_char * data, int skblen)
 			return;
 		}
 
-		// 不是第一次握手 || 服务器tcp没有关 || 用户没有发送syn
-		// 就会return
+		// 否则是server的。
+		
+		// 如果client 刚刚发送syn 并且 服务器没打开 并且 ACK==1 那么它是第二次握手
+		// 参考: add_new_tcp函数 和 "TCP/IP三次握手协议"
 		if (a_tcp->client.state != TCP_SYN_SENT ||
 		        a_tcp->server.state != TCP_CLOSE || !(this_tcphdr->th_flags & TH_ACK))
 			return;
 
+		// 当且仅当是第二次握手(来自server端)才会往下执行
+
 		// 序列不是想要的，也会返回
+		// seq 作为下一个将要发送的序号(每次更新之后会等于对方的ack)
+		// 如果不是按序发送，则返回。
 		if (a_tcp->client.seq != ntohl(this_tcphdr->th_ack))//不是想要的序列，丢弃
 			return;
 
@@ -1037,7 +1320,10 @@ process_tcp(u_char * data, int skblen)
 				a_tcp->client.ts_on = 0;
 		}
 		// 否则client是关闭的话，server也要关掉
-		else a_tcp->server.ts_on = 0;
+		else 
+		{
+			a_tcp->server.ts_on = 0;
+		}
 
 		// 把网络包中的对应值,wscale保存下来
 		if (a_tcp->client.wscale_on)
@@ -1057,12 +1343,13 @@ process_tcp(u_char * data, int skblen)
 		}
 		return;
 	}
+	// 以上一个if是第二次握手
 
-	
-	// 否则执行下面代码
+	//--------------------------------
+	// 否则执行下面代码,不是第一次也不是第二次握手
 	// 不满足一些条件，就return
 	if (
-		// 不满足 (没有数据并且序号形同)
+		// 不满足 (没有数据并且序号相同)
 	    ! (  !datalen && ntohl(this_tcphdr->th_seq) == rcv->ack_seq  )
 	    &&
 	    //  发送的序列不在接受的范围之内 (超过窗口上限或低于窗口下限)
@@ -1070,10 +1357,10 @@ process_tcp(u_char * data, int skblen)
 	      before(ntohl(this_tcphdr->th_seq) + datalen, rcv->ack_seq)
 	    )
 	)
+		// 那么丢弃
 		return;
 
 	
-
 	// 否则不返回
 
 	
@@ -1119,7 +1406,15 @@ process_tcp(u_char * data, int skblen)
 				a_tcp->client.ack_seq = ntohl(this_tcphdr->th_ack);
 				// 跟新tcp的时间戳
 				a_tcp->ts = nids_last_pcap_header->ts.tv_sec;
-				
+
+				/**
+					下面这一段加了花括号代码的功能:
+
+
+					
+				**/
+				// 为什么这里需要加大括号?
+				// 因为需要使用局部变量 i j data
 				{
 					struct proc_node *i;
 					struct lurker_node *j;
@@ -1132,21 +1427,37 @@ process_tcp(u_char * data, int skblen)
 					// 循环回调所有用户已经注册了的tcp回调函数
 					for (i = tcp_procs; i; i = i->next)
 					{
+						// 这个变量用来记录用户的动作
 						char whatto = 0;
+						// 首先记录原来的 client.collect.
+						// server.cllect 等的值，
+						// 然后在用户的回调函数中会依据用户的喜好决定
+						// 是否修改client.collect或者server.collect.的值。
 						char cc = a_tcp->client.collect;
 						char sc = a_tcp->server.collect;
 						char ccu = a_tcp->client.collect_urg;
 						char scu = a_tcp->server.collect_urg;
 
-						// 执行用户注册的某一个tcp回调函数
+						/* 执行用户注册的某一个tcp回调函数
+						   这一句表明，每收到一个tcp报文就会立即回调一次
+						   用户注册的回调函数。*/
 						(i->item) (a_tcp, &data);
-						// 设置whatto
+
+						/* 根据用户回调函数的修改，判断用户需要做什么事，从而
+						   设置whatto。*/
+						// 如果用户增加了client.collect的大小，
+						// 说明用户希望接收客户端的普通包
+						// 于是置位whatto最低位。
 						if (cc < a_tcp->client.collect)
 							whatto |= COLLECT_cc;
+						// 如果用户增加了client.collect_urg的大小
+						// 说明用户希望接收客户端紧急包
+						// 于是置位whatto 次次低位。
 						if (ccu < a_tcp->client.collect_urg)
 							whatto |= COLLECT_ccu;
+						// 下面类似，将whatto的不同位置为1
 						if (sc < a_tcp->server.collect)
-							whatto |= COLLECT_sc;
+							whatto |= COLLECT_sc; 
 						if (scu < a_tcp->server.collect_urg)
 							whatto |= COLLECT_scu;
 
@@ -1166,10 +1477,13 @@ process_tcp(u_char * data, int skblen)
 							}
 						}
 
-
+						// 如果用户需要做某些事情，那么whatto就不会为空
 						// 申请一个listener并且挂到头
 						if (whatto)
 						{
+							// 生成一个listener并将用户注册的函数作为
+							// 这个listener的函数，
+							// 这个listener会挂载到对应的a_tcp上
 							j = mknew(struct lurker_node);
 							j->item = i->item;
 							j->data = data;
@@ -1178,20 +1492,23 @@ process_tcp(u_char * data, int skblen)
 							a_tcp->listeners = j;
 						}
 					}
-
-					// 所有tcp回调函数都已经执行完了
-
-
+					
 					// 如果没有listener 就释放次tcp并返回
+					// 因为这个tcp不用监听
 					if (!a_tcp->listeners)
 					{
 						nids_free_tcp_stream(a_tcp);
 						return;
 					}
 
-					// 否则继续处理数据
+					// 否则将nids_stat设置为NIDS_DATA
+					// 表示已经有数据到来了，但是数据还没有被用户处理
 					a_tcp->nids_state = NIDS_DATA;
 				}
+				/**
+					注意上面这一段加了花括号的代码
+				**/
+				
 			}
 			// return;
 		}
@@ -1199,7 +1516,17 @@ process_tcp(u_char * data, int skblen)
 	}
 
 
-	// 在此判断是否是出了第一条之外的
+	/**
+	   注意: 执行完上述语句，process_tcp并没有结束。
+
+	   - 首先，上述过程执行之后，用户注册的回调函数已经被执行了。
+	   - 然后才执行下面的代码，下面的代码是将刚刚接收到的这个tcp报文
+	     进行判断，是否需要保存到a_tcp的缓冲区中，或者是否是挥手报文。
+	**/
+
+
+	// 判断是否满足四次握手
+	// 在这个if中，如果满足了"完成了四次握手"这个条件，则关闭并释放。
 	if ((this_tcphdr->th_flags & TH_ACK))
 	{
 		// 更新ack
@@ -1224,11 +1551,15 @@ process_tcp(u_char * data, int skblen)
 	}
 
 	
-	//四次握手释放
+	// 否则不满足四次挥手的条件，那么就要处理这一个报文
+	// 很可能就是放入缓存中。
 	if (datalen + (this_tcphdr->th_flags & TH_FIN) > 0)
+	{
 		tcp_queue(a_tcp, this_tcphdr, snd, rcv,
 		          (char *) (this_tcphdr) + 4 * this_tcphdr->th_off,
 		          datalen, skblen);
+	}
+	
 	// 发送窗口更新为当前数据包的窗口大小
 	snd->window = ntohs(this_tcphdr->th_win);
 	// 如果接收方的内存大于65535则释放掉所有占用的内存。
